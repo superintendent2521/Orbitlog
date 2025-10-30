@@ -35,7 +35,7 @@ Orbital Log is a lightweight FastAPI + PostgreSQL service for recording backend 
 
 3. **Configure the database URL**
 
-   FastAPI reads `DATABASE_URL`. Create a `.env` file or export the variable before running the app:
+   FastAPI reads `DATABASE_URL` and automatically loads `.env` from the project root. Either edit `.env` or export the variable before running the app:
 
    ```bash
    set DATABASE_URL=postgresql+psycopg2://postgres:postgres@localhost:5432/orbitallog  # PowerShell

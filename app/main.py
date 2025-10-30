@@ -1,3 +1,6 @@
+import logging
+import os
+import time
 from typing import List, Optional
 
 from fastapi import Depends, FastAPI, Query, Request
@@ -5,18 +8,35 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import OperationalError
 
 from . import crud, models, schemas
 from .database import engine, get_db
 
 APP_TITLE = "Orbital Log"
 
-models.Base.metadata.create_all(bind=engine)
-
 app = FastAPI(title=APP_TITLE, version="0.1.0")
 
 templates = Jinja2Templates(directory="app/templates")
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
+
+
+@app.on_event("startup")
+def ensure_tables() -> None:
+    """Create database tables with basic retry so startup waits for the DB."""
+    retries = int(os.getenv("DB_STARTUP_RETRIES", "5"))
+    delay = float(os.getenv("DB_STARTUP_DELAY", "2.0"))
+    for attempt in range(1, retries + 1):
+        try:
+            models.Base.metadata.create_all(bind=engine)
+            return
+        except OperationalError as exc:
+            logging.warning(
+                "Database connection failed (attempt %s/%s): %s", attempt, retries, exc
+            )
+            if attempt == retries:
+                raise
+            time.sleep(delay)
 
 
 @app.get("/", response_class=HTMLResponse)

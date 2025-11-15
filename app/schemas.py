@@ -1,32 +1,59 @@
+from __future__ import annotations
+
+import uuid
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, validator
 
+from .config import settings
 
-class LogEntryBase(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    key: str = Field(..., min_length=1, max_length=255)
-    name: str = Field(..., min_length=1, max_length=255)
-    text: Optional[str] = Field(None, max_length=10_000)
-    payload: Optional[Dict[str, Any]] = None
-    duration_ms: Optional[int] = Field(None, ge=0)
-    observed_at: Optional[datetime] = None
-
-    @field_validator("key", "name")
-    def strip_value(cls, value: str) -> str:
-        stripped = value.strip()
-        if not stripped:
-            raise ValueError("must not be blank")
-        return stripped
+_ALLOWED_CODES = set(settings.allowed_status_codes)
 
 
-class LogEntryCreate(LogEntryBase):
+class LogBase(BaseModel):
+    message: str = Field(min_length=1, max_length=settings.max_message_length)
+    code: int
+    meta: dict[str, Any] | None = Field(default=None, description="Optional structured metadata")
+
+    @validator("code")
+    def validate_code(cls, value: int) -> int:
+        if value not in _ALLOWED_CODES:
+            raise ValueError(f"code must be one of {_ALLOWED_CODES}")
+        return value
+
+
+class LogCreate(LogBase):
     pass
 
 
-class LogEntryRead(LogEntryBase):
-    id: int
+class LogRead(LogBase):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    workspace_id: str
     created_at: datetime
-    updated_at: datetime
+
+
+class LogListResponse(BaseModel):
+    items: list[LogRead]
+    total: int
+    limit: int
+    offset: int
+
+
+class CodeCount(BaseModel):
+    code: int
+    count: int
+
+
+class WorkspaceStats(BaseModel):
+    workspace_id: str
+    totals: list[CodeCount]
+    total_events: int
+
+
+class GlobalStats(BaseModel):
+    totals: list[CodeCount]
+    distinct_workspaces: int
+    total_events: int

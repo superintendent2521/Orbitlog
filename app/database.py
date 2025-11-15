@@ -1,28 +1,32 @@
-import os
-from pathlib import Path
-from typing import Generator
+from collections.abc import AsyncGenerator
 
-from dotenv import load_dotenv
-from sqlalchemy import create_engine
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-load_dotenv(BASE_DIR / ".env")
-
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql+psycopg2://postgres:postgres@localhost:5432/orbitallog",
-)
-
-# Create SQLAlchemy engine and session factory.
-engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
-SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False, future=True)
+from .config import settings
 
 
-def get_db() -> Generator[Session, None, None]:
-    """Provide a transactional scope around a series of operations."""
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+class Base(DeclarativeBase):
+    """Declarative base all ORM models inherit from."""
+
+
+engine = create_async_engine(settings.database_url, echo=False, future=True, pool_pre_ping=True)
+AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+
+async def get_session() -> AsyncGenerator[AsyncSession, None]:
+    async with AsyncSessionLocal() as session:
+        yield session
+
+
+async def init_db() -> None:
+    """Create database tables if they do not exist."""
+
+    from . import models  # noqa: F401 - ensure models are imported
+
+    async with engine.begin() as conn:
+        await conn.run_sync(models.Base.metadata.create_all)
+
+
+async def close_db() -> None:
+    await engine.dispose()

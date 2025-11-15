@@ -1,105 +1,127 @@
 # Orbital Log
 
-Orbital Log is a lightweight FastAPI + PostgreSQL service for recording backend operations. Each log entry is stored with a key, a human-friendly name, optional free-form text, and structured JSON payloads so you can capture context such as queries, timings, request metadata, and more. A bundled single-page frontend lets you submit new entries and browse existing ones without extra tooling.
+Orbital Log is a FastAPI + PostgreSQL logging platform built around 16-digit workspace identifiers. Client applications send string payloads (plus optional structured metadata) to a workspace, and backend teams retrieve, filter, and aggregate the logs with millisecond timestamps and HTTP-style status buckets (200/300/400/500).
 
-## Features
+## Highlights
 
-- FastAPI backend with SQLAlchemy models stored in PostgreSQL.
-- JSON payload support (PostgreSQL `JSONB`) for arbitrary structured data.
-- REST endpoints to create and list log entries with filtering by key or name.
-- Minimal HTML/JS frontend for submitting logs and viewing recent activity.
+- **PostgreSQL-first** storage using SQLAlchemy 2.0 with async sessions and JSON columns.
+- **Strict workspace IDs** � every request validates a 16-digit numeric identifier before it can be logged or queried.
+- **Status-code tracking** � ingest, filter, and aggregate on the canonical 200/300/400/500 buckets to spot regressions quickly.
+- **Async FastAPI app** with auto-created schema on startup, CORS enabled, and typed request/response models.
+- **Benchmarks included** via `scripts/benchmark.py`, capable of hitting a running server or the app in-process.
 
-## Prerequisites
-
-- Python 3.10 or newer.
-- PostgreSQL 13+ (local install or container).
-- (Optional) [uvicorn](https://www.uvicorn.org/) for development server.
-
-## Quickstart
-
-1. **Clone and install dependencies**
-
-   ```bash
-   python -m venv .venv
-   .venv\Scripts\activate  # Windows
-   pip install -r requirements.txt
-   ```
-
-2. **Start PostgreSQL**
-
-   If you do not have PostgreSQL installed locally, you can run it via Docker:
-
-   ```bash
-   docker run --name orbitallog-db -e POSTGRES_PASSWORD=postgres -e POSTGRES_USER=postgres -e POSTGRES_DB=orbitallog -p 5432:5432 -d postgres:15
-   ```
-
-3. **Configure the database URL**
-
-   FastAPI reads `DATABASE_URL` and automatically loads `.env` from the project root. Either edit `.env` or export the variable before running the app:
-
-   ```bash
-   set DATABASE_URL=postgresql+psycopg2://postgres:postgres@localhost:5432/orbitallog  # PowerShell
-   ```
-
-4. **Run the server**
-
-   ```bash
-   uvicorn app.main:app --reload
-   ```
-
-   Visit `http://localhost:8000` for the frontend and `http://localhost:8000/docs` for the interactive OpenAPI docs.
-
-## API Overview
-
-### Create a log entry
-
-```http
-POST /api/logs
-Content-Type: application/json
-
-{
-  "key": "db.query.users",
-  "name": "Fetch user list",
-  "text": "Retrieved active users for dashboard",
-  "payload": {
-    "query": "select * from users",
-    "time": "1592 ms"
-  },
-  "duration_ms": 1592
-}
-```
-
-### List logs
-
-```http
-GET /api/logs?key=db.query.users
-```
-
-Returns recent entries in descending order by creation time.
-
-## Project Structure
+## Project layout
 
 ```
 app/
-├── crud.py          # Database helpers
-├── database.py      # Engine & session management
-├── main.py          # FastAPI application
-├── models.py        # SQLAlchemy models
-├── schemas.py       # Pydantic models
-├── static/          # Frontend assets
-└── templates/       # Jinja2 templates
+  config.py         # Settings + validation
+  database.py       # Async engine/session + lifecycle helpers
+  main.py           # FastAPI application & routers
+  models.py         # SQLAlchemy ORM models
+  schemas.py        # Pydantic request/response models
+  utils.py          # Workspace validation helpers
+scripts/
+  benchmark.py      # Async load generator & reporter
 ```
 
-## Development Notes
+## Quick start
 
-- Tables are auto-created on start-up if they do not exist.
-- The frontend uses the REST API; you can easily swap it for another UI or integrate with other services.
-- Add authentication, retention policies, or alerting hooks as your logging needs grow.
+1. **Install dependencies** (Python 3.10+)
 
-## Cleanup
+   ```powershell
+   python -m venv .venv
+   .\.venv\Scripts\activate
+   pip install -r requirements.txt
+   ```
 
-To stop the Docker database (if you used it):
+2. **Start PostgreSQL** (local or container). A minimal Docker setup is included:
 
-```bash
-docker stop orbitallog-db && docker rm orbitallog-db
+   ```powershell
+   docker compose up -d db
+   ```
+
+3. **Configure the API**. Copy `.env.example` to `.env` and adjust credentials if needed. Default is `postgresql+asyncpg://orbital:orbital@localhost:5432/orbitallog`.
+
+4. **Run the server**:
+
+   ```powershell
+   uvicorn app.main:app --reload
+   ```
+
+   Automatic migrations: the ORM schema is created on startup; no Alembic step is required for the first run.
+
+5. **Interact with the API** via [http://localhost:8000/docs](http://localhost:8000/docs) or `curl`:
+
+   ```bash
+   curl -X POST http://localhost:8000/workspaces/1234567890123456/logs \
+        -H "Content-Type: application/json" \
+        -d '{
+              "message": "Cache primed",
+              "code": 200,
+              "meta": {"host": "api-1"}
+            }'
+
+   curl "http://localhost:8000/workspaces/1234567890123456/logs?limit=20&code=400"
+   curl http://localhost:8000/workspaces/1234567890123456/stats
+   curl http://localhost:8000/stats/codes
+   ```
+
+## Docker
+
+The included `docker-compose.yml` builds the API image and wires it to PostgreSQL:
+
+```powershell
+docker compose up --build
 ```
+
+The API will be available on `http://localhost:8000` and points to the in-cluster Postgres by default.
+
+## Benchmarking
+
+`scripts/benchmark.py` fires concurrent ingest requests and prints latency/throughput metrics. It can either hit a running deployment or run the ASGI app in-process (using SQLite for convenience):
+
+```powershell
+# In-process benchmark (SQLite) used for the sample numbers below
+python -m scripts.benchmark --inprocess --requests 500 --concurrency 50 --message-size 180
+
+# Against a live server + Postgres
+python -m scripts.benchmark --url http://localhost:8000 --workspace 5555555555555555 --requests 1000 --concurrency 80
+```
+
+Sample output from the in-process run on this machine:
+
+```
+Benchmark Results
+-----------------
+duration     : 6.26 s
+throughput   : 79.8 req/s
+mean_latency : 0.58 s
+p95_latency  : 1.35 s
+p99_latency  : 4.38 s
+successes    : 500
+```
+
+Use the provided options (`--requests`, `--concurrency`, `--message-size`, `--workspace`) to mirror real workloads. For production-like numbers you should point the script at a deployed API backed by PostgreSQL.
+
+## Environment variables
+
+| Variable        | Default                                                         | Description                                  |
+|-----------------|-----------------------------------------------------------------|----------------------------------------------|
+| `DATABASE_URL`  | `postgresql+asyncpg://orbital:orbital@localhost:5432/orbitallog` | SQLAlchemy async connection string           |
+| `ENVIRONMENT`   | `dev`                                                            | Arbitrary environment tag for logging        |
+
+## API summary
+
+| Endpoint | Description |
+|----------|-------------|
+| `POST /workspaces/{workspace_id}/logs` | Validate workspace ID and persist a log message with code + optional metadata |
+| `GET /workspaces/{workspace_id}/logs` | Paginated retrieval with filters for code, text search, and time range |
+| `GET /workspaces/{workspace_id}/stats` | Returns counts per 200/300/400/500 bucket plus totals for the workspace |
+| `GET /stats/codes` | Global aggregation over all workspaces and distinct workspace count |
+| `GET /healthz` | Simple health probe |
+
+## Next steps
+
+- Wire the ingestion endpoint behind auth (API keys, OAuth, or tenancy headers).
+- Extend status tracking to arbitrary tags (region, version, etc.) and expose more analytics endpoints.
+- Ship the benchmark results to dashboards or CI to catch regressions automatically.

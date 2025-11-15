@@ -1,66 +1,162 @@
-import logging
-import os
-import time
-from typing import List, Optional
+from __future__ import annotations
 
-from fastapi import Depends, FastAPI, Query, Request
-from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
-from sqlalchemy.orm import Session
-from sqlalchemy.exc import OperationalError
+from contextlib import asynccontextmanager
+from datetime import datetime
+from typing import Annotated
 
-from . import crud, models, schemas
-from .database import engine, get_db
+from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import Select, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-APP_TITLE = "Orbital Log"
-
-app = FastAPI(title=APP_TITLE, version="0.1.0")
-
-templates = Jinja2Templates(directory="app/templates")
-app.mount("/static", StaticFiles(directory="app/static"), name="static")
+from . import models, schemas
+from .config import settings
+from .database import close_db, get_session, init_db
+from .utils import normalize_workspace_id
 
 
-@app.on_event("startup")
-def ensure_tables() -> None:
-    """Create database tables with basic retry so startup waits for the DB."""
-    retries = int(os.getenv("DB_STARTUP_RETRIES", "5"))
-    delay = float(os.getenv("DB_STARTUP_DELAY", "2.0"))
-    for attempt in range(1, retries + 1):
-        try:
-            models.Base.metadata.create_all(bind=engine)
-            return
-        except OperationalError as exc:
-            logging.warning(
-                "Database connection failed (attempt %s/%s): %s", attempt, retries, exc
-            )
-            if attempt == retries:
-                raise
-            time.sleep(delay)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    yield
+    await close_db()
 
 
-@app.get("/", response_class=HTMLResponse)
-def index(request: Request) -> HTMLResponse:
-    """Serve the lightweight frontend."""
-    return templates.TemplateResponse("index.html", {"request": request, "title": APP_TITLE})
+app = FastAPI(title="Orbital Log", version="0.1.0", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+LimitQuery = Annotated[
+    int,
+    Query(
+        ge=1,
+        le=settings.max_page_size,
+        description="Maximum number of log entries to return",
+        example=50,
+    ),
+]
+OffsetQuery = Annotated[int, Query(ge=0)]
 
 
-@app.post("/api/logs", response_model=schemas.LogEntryRead, status_code=201)
-def create_log_entry(
-    payload: schemas.LogEntryCreate, db: Session = Depends(get_db)
-) -> schemas.LogEntryRead:
-    """Create a log entry."""
-    return crud.create_log_entry(db, payload)
+@app.get("/healthz")
+async def healthcheck() -> dict[str, str]:
+    return {"status": "ok"}
 
 
-@app.get("/api/logs", response_model=List[schemas.LogEntryRead])
-def list_log_entries(
+@app.post(
+    "/workspaces/{workspace_id}/logs",
+    response_model=schemas.LogRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def ingest_log(
+    workspace_id: str,
+    payload: schemas.LogCreate,
+    session: AsyncSession = Depends(get_session),
+) -> schemas.LogRead:
+    workspace_id = normalize_workspace_id(workspace_id)
+    entry = models.LogEntry(
+        workspace_id=workspace_id,
+        message=payload.message,
+        code=payload.code,
+        meta=payload.meta,
+    )
+    session.add(entry)
+    await session.commit()
+    await session.refresh(entry)
+    return entry
+
+
+@app.get("/workspaces/{workspace_id}/logs", response_model=schemas.LogListResponse)
+async def read_logs(
+    workspace_id: str,
+    limit: LimitQuery = settings.default_page_size,
+    offset: OffsetQuery = 0,
+    code: int | None = Query(default=None, description="Filter by code bucket (200/300/400/500)"),
+    search: str | None = Query(default=None, description="Full text search over message bodies"),
+    start: datetime | None = Query(default=None, description="ISO timestamp lower bound"),
+    end: datetime | None = Query(default=None, description="ISO timestamp upper bound"),
+    session: AsyncSession = Depends(get_session),
+) -> schemas.LogListResponse:
+    workspace_id = normalize_workspace_id(workspace_id)
+    if code is not None and code not in settings.allowed_status_codes:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"code must be one of {settings.allowed_status_codes}",
+        )
+    stmt = select(models.LogEntry).where(models.LogEntry.workspace_id == workspace_id)
+    count_stmt: Select[int] = select(func.count()).select_from(models.LogEntry).where(
+        models.LogEntry.workspace_id == workspace_id
+    )
+    stmt, count_stmt = _apply_common_filters(stmt, count_stmt, code=code, search=search, start=start, end=end)
+    stmt = stmt.order_by(models.LogEntry.created_at.desc()).offset(offset).limit(limit)
+
+    result = await session.execute(stmt)
+    entries = result.scalars().all()
+
+    total = await session.scalar(count_stmt) or 0
+
+    return schemas.LogListResponse(items=entries, total=total, limit=limit, offset=offset)
+
+
+@app.get(
+    "/workspaces/{workspace_id}/stats",
+    response_model=schemas.WorkspaceStats,
+)
+async def workspace_stats(
+    workspace_id: str,
+    session: AsyncSession = Depends(get_session),
+) -> schemas.WorkspaceStats:
+    workspace_id = normalize_workspace_id(workspace_id)
+    stmt = (
+        select(models.LogEntry.code, func.count())
+        .where(models.LogEntry.workspace_id == workspace_id)
+        .group_by(models.LogEntry.code)
+    )
+    rows = await session.execute(stmt)
+    counts = {code: count for code, count in rows.all()}
+    ordered = [schemas.CodeCount(code=code, count=counts.get(code, 0)) for code in settings.allowed_status_codes]
+    total = sum(item.count for item in ordered)
+    return schemas.WorkspaceStats(workspace_id=workspace_id, totals=ordered, total_events=total)
+
+
+@app.get("/stats/codes", response_model=schemas.GlobalStats)
+async def global_code_stats(session: AsyncSession = Depends(get_session)) -> schemas.GlobalStats:
+    stmt = select(models.LogEntry.code, func.count()).group_by(models.LogEntry.code)
+    rows = await session.execute(stmt)
+    counts = {code: count for code, count in rows.all()}
+
+    workspace_stmt = select(func.count(func.distinct(models.LogEntry.workspace_id)))
+    distinct_workspaces = await session.scalar(workspace_stmt) or 0
+
+    ordered = [schemas.CodeCount(code=code, count=counts.get(code, 0)) for code in settings.allowed_status_codes]
+    total = sum(item.count for item in ordered)
+    return schemas.GlobalStats(totals=ordered, distinct_workspaces=distinct_workspaces, total_events=total)
+
+
+def _apply_common_filters(
+    stmt: Select[models.LogEntry],
+    count_stmt: Select[int],
     *,
-    key: Optional[str] = Query(default=None, description="Filter by key"),
-    name: Optional[str] = Query(default=None, description="Filter by name"),
-    skip: int = Query(default=0, ge=0),
-    limit: int = Query(default=50, ge=1, le=500),
-    db: Session = Depends(get_db),
-) -> List[schemas.LogEntryRead]:
-    """List log entries with optional filtering."""
-    return crud.list_log_entries(db, skip=skip, limit=limit, key=key, name=name)
+    code: int | None,
+    search: str | None,
+    start: datetime | None,
+    end: datetime | None,
+) -> tuple[Select[models.LogEntry], Select[int]]:
+    if code is not None:
+        stmt = stmt.where(models.LogEntry.code == code)
+        count_stmt = count_stmt.where(models.LogEntry.code == code)
+    if search:
+        pattern = f"%{search}%"
+        stmt = stmt.where(models.LogEntry.message.ilike(pattern))
+        count_stmt = count_stmt.where(models.LogEntry.message.ilike(pattern))
+    if start:
+        stmt = stmt.where(models.LogEntry.created_at >= start)
+        count_stmt = count_stmt.where(models.LogEntry.created_at >= start)
+    if end:
+        stmt = stmt.where(models.LogEntry.created_at <= end)
+        count_stmt = count_stmt.where(models.LogEntry.created_at <= end)
+    return stmt, count_stmt

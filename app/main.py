@@ -10,6 +10,7 @@ from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from . import models, schemas
+from .batcher import LogBatcher
 from .config import settings
 from .database import close_db, get_session, init_db
 from .utils import normalize_workspace_id
@@ -18,7 +19,9 @@ from .utils import normalize_workspace_id
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    log_batcher.start()
     yield
+    await log_batcher.stop()
     await close_db()
 
 
@@ -41,6 +44,8 @@ LimitQuery = Annotated[
 ]
 OffsetQuery = Annotated[int, Query(ge=0)]
 
+log_batcher = LogBatcher(max_batch_size=10, flush_interval=0.150)
+
 
 @app.get("/healthz")
 async def healthcheck() -> dict[str, str]:
@@ -55,18 +60,14 @@ async def healthcheck() -> dict[str, str]:
 async def ingest_log(
     workspace_id: str,
     payload: schemas.LogCreate,
-    session: AsyncSession = Depends(get_session),
 ) -> schemas.LogRead:
     workspace_id = normalize_workspace_id(workspace_id)
-    entry = models.LogEntry(
+    entry = await log_batcher.enqueue(
         workspace_id=workspace_id,
         message=payload.message,
         code=payload.code,
         meta=payload.meta,
     )
-    session.add(entry)
-    await session.commit()
-    await session.refresh(entry)
     return entry
 
 

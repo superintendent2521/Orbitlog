@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
@@ -19,9 +19,11 @@ from .utils import normalize_workspace_id
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
-    log_batcher.start()
+    if log_batcher is not None:
+        log_batcher.start()
     yield
-    await log_batcher.stop()
+    if log_batcher is not None:
+        await log_batcher.stop()
     await close_db()
 
 
@@ -44,7 +46,9 @@ LimitQuery = Annotated[
 ]
 OffsetQuery = Annotated[int, Query(ge=0)]
 
-log_batcher = LogBatcher(max_batch_size=10, flush_interval=0.150)
+log_batcher: LogBatcher | None = (
+    LogBatcher(max_batch_size=10, flush_interval=0.150) if settings.batch_ingest_enabled else None
+)
 
 
 @app.get("/healthz")
@@ -60,14 +64,27 @@ async def healthcheck() -> dict[str, str]:
 async def ingest_log(
     workspace_id: str,
     payload: schemas.LogCreate,
+    session: AsyncSession = Depends(get_session),
 ) -> schemas.LogRead:
     workspace_id = normalize_workspace_id(workspace_id)
-    entry = await log_batcher.enqueue(
+    if log_batcher is not None:
+        entry = await log_batcher.enqueue(
+            workspace_id=workspace_id,
+            message=payload.message,
+            code=payload.code,
+            meta=payload.meta,
+        )
+        return entry
+
+    entry = models.LogEntry(
         workspace_id=workspace_id,
         message=payload.message,
         code=payload.code,
         meta=payload.meta,
+        created_at=datetime.now(timezone.utc),
     )
+    session.add(entry)
+    await session.commit()
     return entry
 
 

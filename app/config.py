@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     max_message_length: int = Field(default=4096, description="Maximum log message length")
     default_page_size: int = Field(default=50, ge=1, le=500)
     max_page_size: int = Field(default=500, ge=50, le=1000)
+    batch_ingest_enabled: bool = Field(default=True, description="Enable async batching for log ingestion")
 
     allowed_status_codes: tuple[int, ...] = (200, 300, 400, 500)
 

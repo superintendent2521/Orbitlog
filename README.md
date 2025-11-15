@@ -42,7 +42,13 @@ scripts/
 
 3. **Configure the API**. Copy `.env.example` to `.env` and adjust credentials if needed. Default is `postgresql+asyncpg://orbital:orbital@localhost:5432/orbitallog`.
 
-4. **Run the server**:
+4. **Create the database once** (if it does not yet exist):
+
+   ```powershell
+   python -m scripts.create_database --dsn postgresql+asyncpg://postgres:<password>@localhost:5432/orbitallog
+   ```
+
+5. **Run the server**:
 
    ```powershell
    uvicorn app.main:app --reload
@@ -50,7 +56,7 @@ scripts/
 
    Automatic migrations: the ORM schema is created on startup; no Alembic step is required for the first run.
 
-5. **Interact with the API** via [http://localhost:8000/docs](http://localhost:8000/docs) or `curl`:
+6. **Interact with the API** via [http://localhost:8000/docs](http://localhost:8000/docs) or `curl`:
 
    ```bash
    curl -X POST http://localhost:8000/workspaces/1234567890123456/logs \

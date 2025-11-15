@@ -92,6 +92,9 @@ python -m scripts.benchmark --inprocess --requests 500 --concurrency 50 --messag
 
 # Against a live server + Postgres
 python -m scripts.benchmark --url http://localhost:8000 --workspace 5555555555555555 --requests 1000 --concurrency 80
+
+# Multi-threaded HTTP run (total concurrency = threads * --concurrency)
+python -m scripts.benchmark --url http://localhost:8000 --requests 2000 --concurrency 40 --threads 4
 ```
 
 Sample output from the in-process run on this machine:
@@ -107,7 +110,7 @@ p99_latency  : 4.38 s
 successes    : 500
 ```
 
-Use the provided options (`--requests`, `--concurrency`, `--message-size`, `--workspace`) to mirror real workloads. For production-like numbers you should point the script at a deployed API backed by PostgreSQL.
+Use the provided options (`--requests`, `--concurrency`, `--message-size`, `--workspace`) to mirror real workloads. Use `--threads` to fan out across CPU cores when targeting remote servers; each thread runs its own set of `--concurrency` async workers so the effective concurrency is `threads * --concurrency`. The flag is ignored in `--inprocess` mode where the ASGI app is hosted inside the process already. For production-like numbers you should point the script at a deployed API backed by PostgreSQL.
 
 ## Environment variables
 
